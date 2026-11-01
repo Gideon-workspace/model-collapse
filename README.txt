@@ -1,176 +1,351 @@
-================================================================================
-NLP Project 1 -- Interpretability of Model Collapse
-In-Context Learning, Induction Heads, and Model Collapse
-================================================================================
+# Transformer Model Collapse: In-Context Learning and Mechanistic Interpretability
 
---------------------------------------------------------------------------------
-1. WHAT THIS CODE DOES
---------------------------------------------------------------------------------
+Investigating how training on model-generated data affects transformer performance, learned representations, and induction circuits.
 
-This implements the project brief's task end to end:
+This project studies **model collapse in causal transformers** using a synthetic in-context learning task. It combines controlled data generation, recursive self-training, and mechanistic interpretability to investigate how model-generated data influences subsequent generations of models.
 
-  1. A small causal transformer trained on the symbolic in-context-learning
-     task of Singh et al. (2024): the context is a sequence of (symbol,
-     label) pairs with a randomised, per-sequence symbol->label mapping; the
-     model must infer the mapping in-context and predict the label for a
-     repeated "query" symbol. This cannot be solved by memorisation (the
-     mapping is re-randomised every sequence and train/val/test use disjoint
-     symbol vocabularies -- see section 4), so solving it requires an
-     induction circuit (a previous-token head feeding an induction head).
+The experiments compare a base prediction task with an extended generative task, examining whether biases in freely generated symbols accumulate across generations and whether these changes coincide with degradation in the model's induction circuit.
 
-  2. A "base" and an "extended" version of the task (config.task.extended):
-       base:     predict only the query label (the brief's "single number").
-       extended: additionally predict ONE more (symbol, label) pair appended
-                 after the query -- i.e. the model must also generate a
-                 "next symbol" and its value. Predicting that symbol is NOT
-                 inferable from context (it is a fresh draw), so the model
-                 must rely on its learned PRIOR over the symbol vocabulary.
-                 This is the deliberate lever for model collapse (see below).
+---
 
-  3. A model-collapse pipeline (collapse.py) that trains a sequence of
-     models, generation 0 on real data and every subsequent generation on
-     its predecessor's own outputs. The CONTEXT and query symbol are always
-     resampled fresh from the true distribution (a "prompt" is always real);
-     only the LOSS-SCORED continuation (the query label, and in the extended
-     task the extra symbol + its label) is replaced by the previous
-     generation's own prediction. This isolates exactly the thing model
-     collapse is about -- training on a model's own generations -- without
-     confounding it with a change in what the model is conditioned on.
-       * mode="pure":  100% of each generation's data is self-generated.
-       * mode="mixed": a fraction p_real of examples keep the TRUE label
-         (fresh real data injected every generation).
-       * sample_temperature: how the teacher model is sampled when building
-         the next generation's targets. 0.0 = greedy ("clean" recursion,
-         the model's own best guess becomes ground truth). 1.0 = proper
-         ancestral sampling ("noisy" recursion -- the setting under which
-         collapse theory predicts degradation).
+## Research Questions
 
-  4. Interpretability (interp.py): previous-token-head / induction-head
-     attention scores, single-head and keep-only ablation, causal activation
-     patching (Conmy et al., 2023 style -- patch one head's output from a
-     "clean" example into a "corrupted" example and see whether the
-     prediction flips), and symbol-embedding geometry (PCA, participation
-     ratio, mean pairwise cosine similarity -- all used to track whether the
-     circuit and/or the representations degrade across generations).
+This project investigates four main questions:
 
---------------------------------------------------------------------------------
-2. WHY THE TASK IS DESIGNED THIS WAY (for the write-up)
---------------------------------------------------------------------------------
+1. **Model collapse:** How does recursively training a transformer on its own generated outputs affect predictive performance and output distributions?
+2. **Generative complexity:** Does predicting an additional, context-independent symbol make a model more susceptible to collapse than predicting only a label?
+3. **Data quality:** Can mixing real data with model-generated data mitigate the degradation observed across generations?
+4. **Mechanistic interpretability:** How do induction heads, attention circuits, and embedding representations change as models are trained on successive generations of synthetic data?
 
-The brief explicitly predicts that collapse is unlikely when "the model has
-to produce a single number from each datapoint" (the base task), because a
-single scalar output gives collapse little room to compound. It also predicts
-that an extended version where the model "predicts the next symbol ... and
-gives its corresponding value" is where collapse should show up, "as the
-model may favour individual symbols which will skew the overall
-distribution." The extended task above is a direct, literal implementation
-of that hint: the extra-symbol prediction is the one output position in the
-whole sequence that is NOT determined by induction (it is unpredictable from
-context by construction), so it is exactly where a model's own biases can
-enter, get baked into the next generation's "real" context symbols, and
-compound. The key diagnostic is therefore the MARGINAL distribution of the
-model's own generated symbols (entropy, KL-from-uniform, "effective support
-size" -- see metrics.py), tracked across generations, alongside the usual
-accuracy/loss/perplexity and the induction-circuit health itself. This also
-gives a natural research question for the discussion section: does
-distributional collapse (in the free generative choice) happen BEFORE
-circuit collapse (in the constrained inductive copy), or do they move
-together?
+The central hypothesis is that distributional degradation in freely generated symbols may occur independently of, or before, the breakdown of the induction circuit used for in-context learning.
 
---------------------------------------------------------------------------------
-3. SETUP
---------------------------------------------------------------------------------
+These questions are investigated experimentally rather than assumed to be true.
 
-Python 3.10+ required.
+## Methodology
 
-    pip install -r requirements.txt
+### 1. In-Context Learning
 
-No GPU is required; everything is sized to train on a CPU in minutes. If you
-do have a GPU, set train.device = "cuda" in config.py / the relevant script.
+A small causal transformer is trained on a synthetic symbolic task in which each sequence contains symbol-label pairs generated using a randomized mapping.
 
---------------------------------------------------------------------------------
-4. HOW TO RUN -- DO THIS FIRST
---------------------------------------------------------------------------------
+Given a sequence of examples and a query symbol, the model must predict the corresponding label by using the information available in the context.
 
-Run the smoke test before anything else. It exercises every code path (data
-generation, training, attention/ablation/patching analysis, and the
-synthetic-data collapse pipeline) on a tiny configuration and takes well
-under a minute:
+Because the symbol-label mapping is randomized for each sequence, the model cannot solve the task simply by memorizing a fixed global mapping.
 
-    cd src
-    python smoke_test.py
+Training, validation, and test sets also use disjoint symbol vocabularies to evaluate generalization to unseen symbols.
 
-It should end with "ALL SMOKE TESTS PASSED". If it raises an exception,
-please keep the full traceback -- every component here was written and
-unit-tested (data.py and metrics.py are pure NumPy and were tested directly;
-the torch-dependent files were carefully reviewed and syntax-checked)
+### 2. Base and Extended Tasks
 
+Two task variants are investigated.
 
-Then run the real experiments:
+| Task | Prediction objective | Purpose |
+|---|---|---|
+| Base | Predict the label associated with the query symbol. | Establish a baseline for constrained in-context prediction. |
+| Extended | Predict the query label and an additional symbol-label pair. | Introduce a freely generated symbol whose distribution can reflect learned model biases. |
 
-    # fast sanity-check run (small data/epochs, ~5-10 min total)
-    python run_experiments.py --preset quick
+The additional symbol in the extended task is sampled independently of the preceding context. Its prediction therefore depends on the model's learned distribution over symbols rather than an existing symbol-label association.
 
-    # the real numbers for the report (larger data/epochs; timing depends on
-    # your machine -- time generation 0 of one condition first and
-    # extrapolate before committing to the full --preset full grid)
-    python run_experiments.py --preset full
+This provides a controlled setting for studying whether biases in model-generated data accumulate over successive training generations.
 
-    # once that has finished, generate every figure used in the write-up
-    python make_report_figures.py --preset full
+### 3. Recursive Model Collapse
 
-`run_experiments.py --stage baseline` trains just the generation-0 models
-(base and extended) including a small learning-rate sweep (use --sweep).
-`--stage collapse` runs the 5-condition collapse grid described in section 1
-(extended task x {pure, mixed} x {temperature 0, temperature 1}, plus one
-base-task control run). `--only <tag>` restricts to a single condition
-(e.g. --only extended_pure_noisy) if you want to iterate on one at a time.
+The model-collapse pipeline begins with a model trained on the original synthetic data.
 
-Individual pieces can also be run directly, e.g.:
+Each subsequent generation is trained using targets produced by the preceding generation.
 
-    python train.py --extended --sweep --n_epochs 30   # just the baseline
+The context and query symbol are freshly sampled from the original task distribution. The loss-scored continuation is replaced with the preceding model's predictions.
 
---------------------------------------------------------------------------------
-5. PROJECT STRUCTURE
---------------------------------------------------------------------------------
+Two training regimes are supported:
 
-src/
-  config.py              task / model / train / collapse configuration (dataclasses)
-  data.py                pure-NumPy task generator (unit-tested, see section 6)
-  torch_data.py           thin torch.utils.data wrapper around data.py
-  model.py                causal transformer with per-head attention access + ablation
-  metrics.py              pure-NumPy entropy/KL/PCA/participation-ratio utilities (unit-tested)
-  train.py                training loop + hyperparameter sweep
-  interp.py               attention scores, ablation, activation patching, embedding geometry
-  collapse.py             the model-collapse pipeline (synthetic data generation + orchestration)
-  run_experiments.py      top-level script: baseline + full collapse grid
-  make_report_figures.py  turns saved results into the figures for the write-up
-  plots.py                plotting functions (has its own fake-data self-test: `python plots.py`)
-  smoke_test.py           fast end-to-end sanity check -- RUN THIS FIRST
+- **Pure self-training:** All continuation targets are generated by the preceding model.
+- **Mixed training:** A configurable proportion of continuation targets is retained from the original data, allowing the effect of real-data injection to be investigated.
 
-results/
-  checkpoints/<run>/      model.pt, history.json, test_metrics.json, config.json per run
-                           (collapse runs: one such folder per generation, gen0/gen1/...)
-  tables/                 collapse_grid_<preset>.json, ablation tables
-  figures/report/         final figures (after make_report_figures.py)
+Two sampling strategies are also supported:
 
---------------------------------------------------------------------------------
-6. WHAT WAS VALIDATED, AND HOW
---------------------------------------------------------------------------------
+- **Greedy sampling:** Uses the model's highest-scoring prediction.
+- **Temperature-based sampling:** Samples predictions from the model's output distribution using a configurable temperature.
 
+These settings allow experiments to distinguish the effects of recursive training, sampling variability, and real-data retention.
 
-  * data.py and metrics.py have NO torch dependency and were fully unit
-    tested here (sequence structure, induction-target correctness, the
-    train/val/test symbol split, burstiness/repeat handling, entropy/KL/PCA
-    sanity checks against known closed-form answers).
-  * plots.py was run end-to-end against synthetic fake data (`python
-    plots.py`) to confirm every figure renders without error.
-  * model.py / train.py / interp.py / collapse.py were syntax-checked
-    (py_compile) and reviewed line by line against the tested data.py
-    contract (tensor shapes, indexing, the loss-masking convention).
-  * smoke_test.py exists specifically to close this gap on your machine: run
-    it first, before any full experiment.
+### 4. Mechanistic Interpretability
 
+The interpretability pipeline examines the internal mechanisms and representations associated with in-context learning.
 
+**Induction circuit analysis**
+- Previous-token and induction-head attention patterns.
+- Attention-based diagnostics for identifying candidate induction circuits.
+- Single-head ablation to investigate the effect of removing individual heads.
+- Keep-only ablation to evaluate the contribution of selected heads.
 
---------------------------------------------------------------------------------
+**Causal activation patching**
+- Transfers a head's output activation from a clean example into a corrupted example.
+- Measures whether the intervention changes the model's prediction.
+- Helps investigate whether specific attention heads causally contribute to the prediction.
+
+**Embedding geometry**
+- Principal component analysis (PCA).
+- Participation ratio as a measure of representation dimensionality.
+- Mean pairwise cosine similarity.
+- Comparisons of symbol representations across training generations.
+
+These analyses help determine whether changes in predictive performance are accompanied by changes in the internal mechanisms used to solve the task.
+
+### 5. Measuring Model Collapse
+
+The experiments track predictive performance, output-distribution changes, and interpretability diagnostics.
+
+| Category | Metrics and analyses |
+|---|---|
+| Predictive performance | Accuracy, loss, and perplexity, where applicable. |
+| Distributional degradation | Symbol entropy, KL divergence from the uniform distribution, and effective support size. |
+| Induction circuits | Attention scores, ablation effects, and activation-patching effects. |
+| Representation geometry | PCA, participation ratio, and mean pairwise cosine similarity. |
+
+The marginal distribution of generated symbols is a particularly important diagnostic.
+
+Entropy and effective support size help quantify how broadly the model distributes its predictions across the symbol vocabulary, while KL divergence from the uniform distribution measures departures from a uniform reference distribution.
+
+Together, these measurements help investigate whether distributional collapse and induction-circuit degradation occur together or follow different trajectories.
+
+---
+
+## Project Structure
+
+```text
+transformer-model-collapse/
+│
+├── src/
+│   ├── config.py
+│   ├── data.py
+│   ├── torch_data.py
+│   ├── model.py
+│   ├── metrics.py
+│   ├── train.py
+│   ├── interp.py
+│   ├── collapse.py
+│   ├── run_experiments.py
+│   ├── make_report_figures.py
+│   ├── plots.py
+│   └── smoke_test.py
+│
+├── results/
+│   ├── checkpoints/
+│   ├── tables/
+│   └── figures/
+│       └── report/
+│
+├── requirements.txt
+└── README.md
+```
+
+### Key Components
+
+| File | Description |
+|---|---|
+| `config.py` | Configures the task, transformer, training procedure, and collapse experiments. |
+| `data.py` | Generates synthetic symbolic in-context learning data. |
+| `torch_data.py` | Provides a PyTorch dataset wrapper. |
+| `model.py` | Implements the causal transformer and attention-head access and ablation functionality. |
+| `metrics.py` | Implements distributional and representation-geometry metrics. |
+| `train.py` | Handles model training and learning-rate sweeps. |
+| `interp.py` | Implements attention analysis, ablation, activation patching, and embedding analysis. |
+| `collapse.py` | Orchestrates recursive self-training and synthetic continuation generation. |
+| `run_experiments.py` | Runs baseline and model-collapse experiments. |
+| `make_report_figures.py` | Generates figures from saved experimental results. |
+| `plots.py` | Contains plotting utilities. |
+| `smoke_test.py` | Runs a small end-to-end test of the main experimental components. |
+
+---
+
+## Getting Started
+
+### Requirements
+
+- Python 3.10 or later.
+- Dependencies listed in `requirements.txt`.
+- A CPU or compatible CUDA-enabled GPU.
+
+The experiments use relatively small transformer models and synthetic datasets. However, full experimental runtimes depend on the configuration, number of generations, training epochs, and hardware.
+
+### Installation
+
+Clone the repository and enter the project directory:
+
+```bash
+git clone https://github.com/YOUR_USERNAME/transformer-model-collapse.git
+cd transformer-model-collapse
+```
+
+Install the dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+### Step 1: Run the Smoke Test
+
+Before running the full experiments, check that the main components execute successfully.
+
+```bash
+cd src
+python smoke_test.py
+```
+
+The expected success message is:
+
+```text
+ALL SMOKE TESTS PASSED
+```
+
+The smoke test exercises the principal data-generation, training, interpretability, and collapse-pipeline code paths using a small configuration.
+
+### Step 2: Run a Quick Experiment
+
+Run a smaller experiment to check the training and evaluation pipeline:
+
+```bash
+python run_experiments.py --preset quick
+```
+
+This is intended for initial testing rather than final research conclusions.
+
+### Step 3: Run the Full Experiments
+
+Run the larger experimental configuration:
+
+```bash
+python run_experiments.py --preset full
+```
+
+Full experiments can take considerably longer than the quick configuration. Test an individual condition first and estimate the total runtime before running the entire experiment grid.
+
+### Step 4: Generate Research Figures
+
+After the experiments have completed, generate the figures for analysis and reporting:
+
+```bash
+python make_report_figures.py --preset full
+```
+
+The generated figures and other outputs are saved under the configured results directory.
+
+---
+
+## Running Individual Experiments
+
+### Baseline Training
+
+Train the generation-zero models for the base and extended tasks:
+
+```bash
+python run_experiments.py --stage baseline
+```
+
+To include the configured learning-rate sweep:
+
+```bash
+python run_experiments.py --stage baseline --sweep
+```
+
+### Collapse Experiments
+
+Run the model-collapse stage:
+
+```bash
+python run_experiments.py --stage collapse
+```
+
+To restrict execution to a single condition, use its configured tag. For example:
+
+```bash
+python run_experiments.py --only extended_pure_noisy
+```
+
+The exact conditions and supported command-line options are defined by the experiment configuration and command-line parser.
+
+### Direct Training
+
+The training script can also be run independently:
+
+```bash
+python train.py --extended --sweep --n_epochs 30
+```
+
+Use the scripts' help options to inspect additional arguments:
+
+```bash
+python run_experiments.py --help
+python train.py --help
+```
+
+---
+
+## Experimental Outputs
+
+The project organizes experimental results into three main categories.
+
+**Model checkpoints**
+
+The `results/checkpoints/` directory stores model checkpoints and associated run metadata, including training histories, evaluation metrics, and configuration files.
+
+Collapse experiments organize results by run and generation.
+
+**Experimental tables**
+
+The `results/tables/` directory stores machine-readable experimental summaries, including collapse-grid results and ablation tables.
+
+**Research figures**
+
+The `results/figures/report/` directory stores the figures generated for the research report.
+
+These outputs support comparisons across task variants, self-training regimes, sampling strategies, and model generations.
+
+---
+
+## Validation and Testing
+
+The project includes several checks intended to improve the reliability of the experimental pipeline.
+
+- **Data generation:** Tests cover sequence structure, induction targets, train/validation/test symbol separation, repetition handling, and other synthetic-data properties.
+- **Metric calculations:** Tests check entropy, KL divergence, PCA-related measures, and participation-ratio calculations against known cases.
+- **Plotting:** Plotting utilities can be exercised using synthetic example data.
+- **End-to-end execution:** The smoke test exercises the major components using a small configuration.
+
+The NumPy-based data and metric utilities have been unit-tested. The plotting pipeline has also been tested using synthetic data. Other components have undergone code review and syntax checks; running the smoke test and the actual experiments is still necessary to verify their integration in your environment.
+
+---
+
+## Research Significance
+
+Model collapse raises questions about the long-term consequences of repeatedly training models on synthetic data.
+
+This project approaches the problem through a controlled experimental setting in which the relationship between context and target is explicitly defined.
+
+Rather than examining output quality alone, it combines distributional metrics with mechanistic interpretability to investigate how recursive training affects both model outputs and the internal representations used to produce them.
+
+The comparison between constrained label prediction and extended symbol generation provides a way to study whether freely generated outputs introduce different failure modes from those associated with in-context prediction.
+
+The results can help clarify the relationship between synthetic-data feedback, distributional concentration, and the stability of learned induction circuits.
+
+## Technologies
+
+- Python
+- PyTorch
+- NumPy
+- Matplotlib
+- Causal transformers
+- In-context learning
+- Mechanistic interpretability
+- Synthetic-data generation
+- Model-collapse analysis
+
+## Acknowledgements
+
+The project draws on research into symbolic in-context learning, induction heads, model collapse, and causal interpretability interventions.
+
+Relevant methodological connections include Singh et al. (2024) on the symbolic in-context learning task and Conmy et al. (2023) on causal circuit analysis. Consult the original publications for the precise methods and theoretical background.
+
+---
+
+**Project status:** Research and experimentation.
+
+Experimental conclusions should be based on completed runs, saved evaluation results, and analysis of the generated figures.
